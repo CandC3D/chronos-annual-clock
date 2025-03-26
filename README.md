@@ -1,4 +1,4 @@
-# annual-clock
+# chronos-annual-clock
 Repository for CHRONOS Annual Clock code
 
 Original code base tested successfully on February 19, 2025. First upload to GitHub of the original code base, improved version, and improved version with provision for debugging on an attached display on March 26, 2025.
