@@ -1,0 +1,266 @@
+#include <WiFi.h>
+#include <time.h>
+#include <sys/time.h>
+
+// ─────────────────────────────────────────────
+//  CHRONOS ANNUAL CLOCK
+//  Original Code Base (pre-GitHub)
+// ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+//  WiFi and NTP Settings
+// ─────────────────────────────────────────────
+
+const char* ssid     = "yourSSID";       // <-- Change to your WiFi SSID
+const char* password = "yourPASSWORD";   // <-- Change to your WiFi Password
+
+// For NTP time syncing (adjust your GMT offset and DST offset as needed)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;    // e.g., 0 for GMT, 3600 for GMT+1, etc.
+const int   daylightOffset_sec = 0;
+
+// ─────────────────────────────────────────────
+//  Hardware Pin Definitions
+// ─────────────────────────────────────────────
+
+// Stepper motor control pins
+const int motorPins[4] = {12, 13, 14, 27};  // Order: IN1, IN2, IN3, IN4
+
+// Photo-interrupter (home sensor) pin:
+const int homePin = 4;  // The sensor output pin
+
+// ─────────────────────────────────────────────
+//  Stepper and Timing Constants
+// ─────────────────────────────────────────────
+
+// Adjust the following constant to match the number of half-steps
+// that produce one full revolution of your clock hand. (For example,
+// many unipolar stepper+gearbox combinations need 4096 half-steps.)
+const long STEPS_PER_REV = 4096;
+
+// Choose a base year for the clock cycles. For example, if you set this
+// to 2000 then December 21, 2000, 2001, … become the “home” positions.
+const int BASE_YEAR = 2000;
+
+// How long to wait between each motor half-step (in ms)
+const int stepDelay = 5;  
+
+// ─────────────────────────────────────────────
+//  Global Variables for Motor Tracking
+// ─────────────────────────────────────────────
+
+// We use an 8-step (half-step) sequence.
+const int stepSequence[8][4] = {
+  {1, 0, 0, 0},
+  {1, 1, 0, 0},
+  {0, 1, 0, 0},
+  {0, 1, 1, 0},
+  {0, 0, 1, 0},
+  {0, 0, 1, 1},
+  {0, 0, 0, 1},
+  {1, 0, 0, 1}
+};
+
+// currentStepIndex tracks our position within the 8-step sequence.
+int currentStepIndex = 0;
+
+// currentAbsoluteSteps is the total number of half-steps taken since a fixed
+// home reference (so that even after one revolution the value keeps increasing).
+volatile long currentAbsoluteSteps = 0;
+
+// ─────────────────────────────────────────────
+//  Function: stepMotorForwardOneStep
+//  Steps the motor one half-step forward (updates the current step index)
+// ─────────────────────────────────────────────
+void stepMotorForwardOneStep() {
+  currentStepIndex = (currentStepIndex + 1) % 8;
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], stepSequence[currentStepIndex][i]);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Function: moveSteps
+//  Moves the motor a given (positive) number of half-steps forward.
+// ─────────────────────────────────────────────
+void moveSteps(long stepsToMove) {
+  // We assume stepsToMove >= 0 (the motor only rotates forward).
+  for (long i = 0; i < stepsToMove; i++) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+    currentAbsoluteSteps++;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Function: homeMotor
+//  Slowly rotates the motor until the photo-interrupter sensor
+//  (now assumed to output LOW when the beam is interrupted)
+//  is triggered. Then, it resets the currentAbsoluteSteps count
+//  so that the home position corresponds to an integer multiple of STEPS_PER_REV.
+// ─────────────────────────────────────────────
+void homeMotor() {
+  Serial.println("Homing: Rotating until sensor is triggered (beam interrupted)...");
+  
+  // Rotate slowly until the sensor reads LOW (i.e., beam is interrupted)
+  while (digitalRead(homePin) == HIGH) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+  }
+  // Pause briefly to let the sensor reading stabilize
+  delay(100);
+  
+  // Use the current time to decide which December 21 is “home.”
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+  
+  // If today's month is December (month 11 in tm, zero-indexed) and the day is 21 or later,
+  // we treat December 21 of the current year as “home.”
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+  
+  // Compute the home cycle count (i.e. how many full revolutions have passed since BASE_YEAR)
+  long cycleCount = homeYear - BASE_YEAR;
+  
+  // Set currentAbsoluteSteps to an exact multiple of STEPS_PER_REV.
+  currentAbsoluteSteps = cycleCount * STEPS_PER_REV;
+  Serial.print("Home set: currentAbsoluteSteps = ");
+  Serial.println(currentAbsoluteSteps);
+}
+
+// ─────────────────────────────────────────────
+//  Function: computeTargetSteps
+//  Computes the “absolute” target step count based on the current date/time.
+//  The idea is that each cycle (from December 21 to December 21)
+//  corresponds to STEPS_PER_REV half-steps, and the fraction of time elapsed
+//  in the current cycle is multiplied by STEPS_PER_REV.
+// ─────────────────────────────────────────────
+long computeTargetSteps() {
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+  
+  // Determine the most recent December 21 (“home”) relative to now.
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+  
+  // Build a struct for December 21 of the home year:
+  struct tm home_tm = {0};
+  home_tm.tm_year = homeYear - 1900;
+  home_tm.tm_mon  = 11;    // December (tm_mon is 0-indexed)
+  home_tm.tm_mday = 21;
+  home_tm.tm_hour = 0;
+  home_tm.tm_min  = 0;
+  home_tm.tm_sec  = 0;
+  time_t homeTime = mktime(&home_tm);
+  
+  // Build a struct for December 21 of the next cycle:
+  struct tm nextHome_tm = home_tm;
+  nextHome_tm.tm_year += 1;
+  time_t nextHomeTime = mktime(&nextHome_tm);
+  
+  // Compute the fraction of the cycle that has elapsed:
+  double fraction = double(now - homeTime) / double(nextHomeTime - homeTime);
+  if (fraction < 0) fraction = 0;
+  if (fraction > 1) fraction = 1;
+  
+  // Compute the number of complete cycles since BASE_YEAR.
+  long cycleCount = homeYear - BASE_YEAR;
+  
+  // The target absolute step count is the number of complete cycles times the steps per revolution,
+  // plus the fractional progress through the current cycle.
+  long targetSteps = cycleCount * STEPS_PER_REV + long(fraction * STEPS_PER_REV);
+  
+  return targetSteps;
+}
+
+// ─────────────────────────────────────────────
+//  setup()
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nAnnual Clock Project Starting...");
+
+  // Initialize motor control pins
+  for (int i = 0; i < 4; i++) {
+    pinMode(motorPins[i], OUTPUT);
+    digitalWrite(motorPins[i], LOW);
+  }
+  // Initialize home sensor pin
+  pinMode(homePin, INPUT);
+  
+  // ───── Connect to WiFi ─────
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+
+  // ───── Initialize NTP Time ─────
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Waiting for time sync...");
+  // Wait until the time is synced (timestamp > ~1e9)
+  while (time(nullptr) < 1000000000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTime synchronized.");
+  
+  // ───── Optional: Check sensor reading for debugging ─────
+  Serial.print("Initial sensor reading: ");
+  Serial.println(digitalRead(homePin));
+
+  // ───── Home the Stepper Motor ─────
+  homeMotor();
+
+  // ───── Move to the current target position ─────
+  long target = computeTargetSteps();
+  Serial.print("Initial target steps = ");
+  Serial.println(target);
+  long stepsToMove = target - currentAbsoluteSteps;
+  if (stepsToMove > 0) {
+    Serial.print("Moving ");
+    Serial.print(stepsToMove);
+    Serial.println(" steps to set initial position.");
+    moveSteps(stepsToMove);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  loop()
+// ─────────────────────────────────────────────
+void loop() {
+  // Compute the absolute target steps for the current date/time.
+  long target = computeTargetSteps();
+  
+  // Debug prints to see current state:
+  Serial.print("currentAbsoluteSteps = ");
+  Serial.print(currentAbsoluteSteps);
+  Serial.print(" | targetSteps = ");
+  Serial.println(target);
+  
+  // If the target is ahead of our current position, move the motor forward.
+  if (target > currentAbsoluteSteps) {
+    long stepsToMove = target - currentAbsoluteSteps;
+    Serial.print("Updating position: moving ");
+    Serial.print(stepsToMove);
+    Serial.println(" steps.");
+    moveSteps(stepsToMove);
+  }
+  
+  // (If currentAbsoluteSteps already equals target, no action is taken.)
+  
+  // Optional: Print the current time for debugging
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  Serial.printf("Time: %02d:%02d:%02d\n", now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec);
+  
+  // Update the motor position about once a minute.
+  delay(60000);
+}
