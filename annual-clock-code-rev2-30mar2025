@@ -1,0 +1,425 @@
+#include <WiFi.h>
+#include <time.h>
+#include <sys/time.h>
+#include <RTClib.h>
+#include <Wire.h>
+
+// ─────────────────────────────────────────────
+//  WiFi and NTP Settings
+// ─────────────────────────────────────────────
+const char* ssid     = "yourSSID";       // <-- Change to your WiFi SSID
+const char* password = "yourPASSWORD";   // <-- Change to your WiFi Password
+const char* ntpServer = "pool.ntp.org";
+
+// POSIX TZ string (example: Eastern Time)
+// Adjust as needed.
+const char* posix_tz = "EST5EDT,M3.2.0/2,M11.1.0/2";
+
+// ─────────────────────────────────────────────
+//  Hardware Pin Definitions
+// ─────────────────────────────────────────────
+const int motorPins[4] = {12, 13, 14, 27};  // Order: IN1, IN2, IN3, IN4
+const int homePin = 4;                       // Photo-interrupter sensor pin
+
+// ─────────────────────────────────────────────
+//  Stepper and Timing Constants
+// ─────────────────────────────────────────────
+const long STEPS_PER_REV = 4096;         // Number of half-steps per revolution
+const int BASE_YEAR = 2000;              // Base year for clock cycles
+const int stepDelay = 5;                 // Delay (ms) between half-steps
+// (Do not redefine SECONDS_PER_DAY; RTClib already defines it.)
+
+// ─────────────────────────────────────────────
+//  User-Adjustable Sensor Delay Compensation
+//  Adjust this variable (in half-steps) to fine-tune the home position.
+// ─────────────────────────────────────────────
+const int sensorDelayAdjustmentSteps = 10; // Adjust as needed
+
+// ─────────────────────────────────────────────
+//  Magic Number Constants (adjustable)
+// ─────────────────────────────────────────────
+const unsigned long WIFI_TIMEOUT_MS      = 30000;   // WiFi connection timeout (ms)
+const unsigned long WIFI_RETRY_DELAY_MS  = 500;     // Delay between WiFi status checks (ms)
+const unsigned long HOME_TIMEOUT_MS      = 10000;   // Home sensor timeout (ms)
+const unsigned long NTP_ATTEMPT_TIMEOUT_MS = 300000; // NTP attempt timeout (ms)
+const unsigned long NTP_CHECK_DELAY_MS   = 1000;    // Delay between NTP time checks (ms)
+const unsigned long MAIN_LOOP_DELAY_MS   = 60000;   // Delay (ms) in main loop (non-fallback mode)
+const unsigned long FALLBACK_INTERVAL_MS = 15UL * 60UL * 1000UL; // Full revolution interval in fallback mode (ms)
+const unsigned long FALLBACK_DELAY_MS    = 1000;    // Delay (ms) in fallback mode loop
+
+// ─────────────────────────────────────────────
+//  Global Variables for Motor Tracking
+// ─────────────────────────────────────────────
+const int stepSequence[8][4] = {
+  {1, 0, 0, 0},
+  {1, 1, 0, 0},
+  {0, 1, 0, 0},
+  {0, 1, 1, 0},
+  {0, 0, 1, 0},
+  {0, 0, 1, 1},
+  {0, 0, 0, 1},
+  {1, 0, 0, 1}
+};
+
+int currentStepIndex = 0;               // Position within the 8-step sequence.
+volatile long currentAbsoluteSteps = 0; // Total half-steps since home.
+
+// ─────────────────────────────────────────────
+//  RTC Instance and Mode Flags
+// ─────────────────────────────────────────────
+RTC_DS3231 rtc;
+bool rtcAvailable = true;
+bool fallbackMode = false;
+bool homeTriggeredToday = false;
+
+// ─────────────────────────────────────────────
+//  Helper Function: isLeapYear
+// ─────────────────────────────────────────────
+bool isLeapYear(int year) {
+  return ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+}
+
+// ─────────────────────────────────────────────
+//  Function: powerDownStepper
+//  Sets all motor control pins LOW to save power.
+// ─────────────────────────────────────────────
+void powerDownStepper() { 
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], LOW);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Function: stepMotorForwardOneStep
+//  Moves the motor one half-step forward.
+// ─────────────────────────────────────────────
+void stepMotorForwardOneStep() {
+  currentStepIndex = (currentStepIndex + 1) % 8;
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], stepSequence[currentStepIndex][i]);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Function: stepMotorBackwardOneStep
+//  Moves the motor one half-step backward (counter-clockwise).
+// ─────────────────────────────────────────────
+void stepMotorBackwardOneStep() {
+  currentStepIndex = (currentStepIndex + 7) % 8; // subtract one modulo 8
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], stepSequence[currentStepIndex][i]);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Function: moveSteps
+//  Moves the motor a given number of half-steps forward.
+// ─────────────────────────────────────────────
+void moveSteps(long stepsToMove) {
+  for (long i = 0; i < stepsToMove; i++) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+    currentAbsoluteSteps++;
+  }
+  powerDownStepper();
+}
+
+// ─────────────────────────────────────────────
+//  Function: moveStepsBackward
+//  Moves the motor a given number of half-steps backward.
+// ─────────────────────────────────────────────
+void moveStepsBackward(long stepsToMove) {
+  for (long i = 0; i < stepsToMove; i++) {
+    stepMotorBackwardOneStep();
+    delay(stepDelay);
+    currentAbsoluteSteps--; // adjust in fallback mode
+  }
+  powerDownStepper();
+}
+
+// ─────────────────────────────────────────────
+//  Function: homeMotor
+//  (Original, proven version)
+//  Rotates the motor slowly until the photo-interrupter sensor reads LOW
+//  (indicating the beam is interrupted), then sets the home position.
+// ─────────────────────────────────────────────
+void homeMotor() {
+  Serial.println("Homing: Rotating until sensor is triggered (beam interrupted)...");
+  // Rotate until sensor reads LOW
+  while (digitalRead(homePin) == HIGH) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+  }
+  delay(100); // Allow sensor reading to stabilize
+  
+  // Use the current time to determine the home reference (December 21)
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+  // If today is December and day is 21 or later, use current year;
+  // otherwise, use previous year.
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+  
+  // Compute the number of complete cycles since BASE_YEAR.
+  long cycleCount = homeYear - BASE_YEAR;
+  
+  // Set home position (adjusted by sensor delay compensation)
+  currentAbsoluteSteps = cycleCount * STEPS_PER_REV - sensorDelayAdjustmentSteps;
+  Serial.print("Home set: currentAbsoluteSteps = ");
+  Serial.println(currentAbsoluteSteps);
+  
+  powerDownStepper();
+}
+
+// ─────────────────────────────────────────────
+//  Function: computeTargetSteps
+//  Computes the target absolute step count based on the current time,
+//  with a leap-year feature that "skips" February 29 in non-leap years.
+// ─────────────────────────────────────────────
+long computeTargetSteps() {
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+  
+  // Determine the most recent "home" (December 21)
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+  
+  // Build homeTime (December 21 of homeYear)
+  struct tm home_tm = {0};
+  home_tm.tm_year = homeYear - 1900;
+  home_tm.tm_mon  = 11; // December (tm_mon is 0-indexed)
+  home_tm.tm_mday = 21;
+  home_tm.tm_hour = 0;
+  home_tm.tm_min  = 0;
+  home_tm.tm_sec  = 0;
+  time_t homeTime = mktime(&home_tm);
+  
+  // Build nextHomeTime (December 21 of next cycle)
+  struct tm nextHome_tm = home_tm;
+  nextHome_tm.tm_year = home_tm.tm_year + 1;
+  time_t nextHomeTime = mktime(&nextHome_tm);
+  
+  // Calculate elapsed seconds since homeTime
+  time_t elapsed = now - homeTime;
+  
+  // Leap-year adjustment:
+  // In non-leap years, skip over February 29 by subtracting one day's seconds
+  int febYear = homeYear + 1;
+  if (!isLeapYear(febYear)) {
+    // Create a struct for February 28, 23:59:59 of febYear
+    struct tm feb28_tm = {0};
+    feb28_tm.tm_year = febYear - 1900;
+    feb28_tm.tm_mon  = 1;  // February (0-indexed)
+    feb28_tm.tm_mday = 28;
+    feb28_tm.tm_hour = 23;
+    feb28_tm.tm_min  = 59;
+    feb28_tm.tm_sec  = 59;
+    time_t feb28End = mktime(&feb28_tm);
+    // If current time is past February 28, subtract one day's seconds
+    if (now > feb28End) {
+      elapsed -= SECONDS_PER_DAY;
+    }
+  }
+  
+  double fraction = double(elapsed) / double(nextHomeTime - homeTime);
+  if (fraction < 0) fraction = 0;
+  if (fraction > 1) fraction = 1;
+  
+  long cycleCount = homeYear - BASE_YEAR;
+  long targetSteps = cycleCount * STEPS_PER_REV + long(fraction * STEPS_PER_REV);
+  return targetSteps;
+}
+
+// ─────────────────────────────────────────────
+//  setup()
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nAnnual Clock Project Starting...");
+
+  // Initialize motor control pins.
+  for (int i = 0; i < 4; i++) {
+    pinMode(motorPins[i], OUTPUT);
+    digitalWrite(motorPins[i], LOW);
+  }
+  // Use the same sensor pin mode as the original successful version.
+  pinMode(homePin, INPUT);
+
+  // ───── WiFi Connection with Timeout ─────
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  unsigned long wifiStartTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - wifiStartTime > WIFI_TIMEOUT_MS) {
+      Serial.println("\nWiFi connection timed out.");
+      break;
+    }
+    delay(WIFI_RETRY_DELAY_MS);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected.");
+  }
+  
+  // Set time zone.
+  setenv("TZ", posix_tz, 1);
+  tzset();
+
+  // ───── RTC Initialization ─────
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC. Check your hardware connection.");
+    rtcAvailable = false;
+  } else {
+    Serial.println("RTC initialized successfully.");
+  }
+  
+  // ───── Time Acquisition ─────
+  bool timeSet = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    int timeAttempts = 0;
+    while (timeAttempts < 3 && !timeSet) {
+      Serial.println("Attempting to get internet time...");
+      configTime(0, 0, ntpServer);
+      unsigned long attemptStart = millis();
+      while (millis() - attemptStart < NTP_ATTEMPT_TIMEOUT_MS) {
+        if (time(nullptr) > 1000000000) {
+          timeSet = true;
+          break;
+        }
+        delay(NTP_CHECK_DELAY_MS);
+      }
+      if (!timeSet) {
+        timeAttempts++;
+        if (timeAttempts < 3) {
+          Serial.println("Time not available, retrying in 5 minutes...");
+        }
+      }
+    }
+    if (!timeSet && rtcAvailable) {
+      DateTime rtcTime = rtc.now();
+      if (!rtc.lostPower() && rtcTime.year() > 2000) {
+        Serial.println("Using RTC time.");
+        timeSet = true;
+      }
+    }
+  }
+  else {
+    Serial.println("WiFi not connected, attempting to use RTC time...");
+    if (rtcAvailable) {
+      DateTime rtcTime = rtc.now();
+      if (!rtc.lostPower() && rtcTime.year() > 2000) {
+        Serial.println("Using RTC time.");
+        timeSet = true;
+      }
+      else {
+        Serial.println("RTC time invalid.");
+      }
+    }
+  }
+  
+  if (!timeSet) {
+    fallbackMode = true;
+    Serial.println("No valid time available. Entering fallback mode.");
+  }
+  else {
+    // If WiFi is not connected, update system time from RTC.
+    if (WiFi.status() != WL_CONNECTED && rtcAvailable) {
+      DateTime rtcTime = rtc.now();
+      timeval tv;
+      tv.tv_sec = rtcTime.unixtime();
+      tv.tv_usec = 0;
+      settimeofday(&tv, NULL);
+      Serial.println("System time updated from RTC.");
+    }
+    else if (WiFi.status() == WL_CONNECTED) {
+      time_t now = time(nullptr);
+      struct tm now_tm;
+      localtime_r(&now, &now_tm);
+      DateTime dt(now_tm.tm_year + 1900, now_tm.tm_mon + 1, now_tm.tm_mday,
+                  now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec);
+      if (rtcAvailable) {
+        rtc.adjust(dt);
+        Serial.println("RTC updated with internet time.");
+      }
+    }
+  }
+  
+  // Perform homing.
+  homeMotor();
+  
+  // If not in fallback mode, set initial motor position.
+  if (!fallbackMode) {
+    long target = computeTargetSteps();
+    Serial.print("Initial target steps = ");
+    Serial.println(target);
+    long stepsToMove = target - currentAbsoluteSteps;
+    if (stepsToMove > 0) {
+      Serial.print("Moving ");
+      Serial.print(stepsToMove);
+      Serial.println(" steps to set initial position.");
+      moveSteps(stepsToMove);
+    }
+  }
+  
+  Serial.println("Startup Complete");
+  delay(1500);
+}
+
+// ─────────────────────────────────────────────
+//  loop()
+// ─────────────────────────────────────────────
+void loop() {
+  if (!fallbackMode) {
+    long target = computeTargetSteps();
+    Serial.print("currentAbsoluteSteps = ");
+    Serial.print(currentAbsoluteSteps);
+    Serial.print(" | targetSteps = ");
+    Serial.println(target);
+    
+    if (target > currentAbsoluteSteps) {
+      long stepsToMove = target - currentAbsoluteSteps;
+      Serial.print("Updating position: moving ");
+      Serial.print(stepsToMove);
+      Serial.println(" steps.");
+      moveSteps(stepsToMove);
+    }
+    
+    time_t now = time(nullptr);
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+    
+    char timeStr[9];  // HH:MM:SS
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec);
+    
+    char dateStr[11]; // YYYY-MM-DD
+    snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d", now_tm.tm_year + 1900, now_tm.tm_mon + 1, now_tm.tm_mday);
+    
+    float angle = (float)(currentAbsoluteSteps % STEPS_PER_REV) * 360.0 / (float)STEPS_PER_REV;
+    
+    Serial.print("Angle: ");
+    Serial.print(angle, 1);
+    Serial.println(" deg");
+    Serial.print("Time: ");
+    Serial.println(timeStr);
+    Serial.print("Date: ");
+    Serial.println(dateStr);
+    Serial.print("Simulated: ");
+    Serial.println("N/A");
+    
+    delay(MAIN_LOOP_DELAY_MS);
+  }
+  else {
+    static unsigned long lastFallbackTime = 0;
+    if (millis() - lastFallbackTime >= FALLBACK_INTERVAL_MS) {
+      Serial.println("Fallback mode: rotating hand counter-clockwise a full revolution.");
+      moveStepsBackward(STEPS_PER_REV);
+      homeMotor();
+      lastFallbackTime = millis();
+    }
+    delay(FALLBACK_DELAY_MS);
+  }
+}
