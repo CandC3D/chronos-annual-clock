@@ -5,7 +5,7 @@ Original code base tested successfully on February 19, 2025. First upload to Git
 
 The CHRONOS Annual Clock combines the mechanism of a traditional clock with a circular calendar, providing a new and different way of visualizing the year. 
 
-The CHRONOS Annual Clock is an electronics and 3D Printing project that will be available on MakerWorld later this Spring.
+The CHRONOS Annual Clock is an electronics and 3D Printing project that will be available on MakerWorld (makerworld.com) later this Spring.
 
 The clock face is marked with the 12 months, signs of the Zodiac, and the seasons. Seasons are available in reverse for those in the Southern Hemisphere. Both an English language and an International version (with symbols) are available.
 
