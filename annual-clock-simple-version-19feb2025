@@ -5,6 +5,8 @@
 // ─────────────────────────────────────────────
 //  CHRONOS ANNUAL CLOCK
 //  Original Code Base (pre-GitHub)
+//  This code can be used to validate the correct operation of
+//  the WiFi connection, sensor, and stepper motor
 // ─────────────────────────────────────────────
 
 // ─────────────────────────────────────────────
