@@ -12,7 +12,7 @@ const char* password = "yourPASSWORD";   // <-- Change to your WiFi Password
 const char* ntpServer = "pool.ntp.org";
 
 // POSIX TZ string (example: Eastern Time)
-// Adjust as needed.
+// Adjust as needed. See README.md for some common strings.
 const char* posix_tz = "EST5EDT,M3.2.0/2,M11.1.0/2";
 
 // ─────────────────────────────────────────────
