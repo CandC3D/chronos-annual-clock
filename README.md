@@ -36,6 +36,7 @@ Improvements implemented since Feb. 19:
 
 
 POSIX TX time zone strings for select locales:
+
 Alaska: AKST+9AKDT,M3.2.0/2,M11.1.0/2
 
 Argentina: ART3
