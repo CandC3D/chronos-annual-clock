@@ -18,7 +18,7 @@ const char* posix_tz = "EST5EDT,M3.2.0/2,M11.1.0/2";
 // ─────────────────────────────────────────────
 //  Hardware Pin Definitions
 // ─────────────────────────────────────────────
-const int motorPins[4] = {12, 13, 14, 27};  // Order: IN1, IN2, IN3, IN4
+const int motorPins[4] = {27, 14, 13, 12};  // Order: IN1, IN2, IN3, IN4
 const int homePin = 4;                       // Photo-interrupter sensor pin
 
 // ─────────────────────────────────────────────
