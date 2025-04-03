@@ -10,8 +10,8 @@ The CHRONOS Annual Clock is an electronics and 3D Printing project that will be 
 The clock face is marked with the 12 months, signs of the Zodiac, and the seasons. Seasons are available in reverse for those in the Southern Hemisphere. Both an English language and an International version (with symbols) are available.
 
 HARDWARE
-- ESP32 Dev Kit C microcontroller (38 pins)
-- ESP32 microcontroller breakout board (optional, but very useful)
+- ESP32 Dev Kit C microcontroller (38 pins) or Freenove ESP32-WROOM
+- ESP32 microcontroller breakout board (optional, but very useful); Freenove's board is specific to their ESP32 and has interesting features
 - LM393 / H206 Slot-type Photo Interrupter Sensor module (LM393 is the microcontroller used, and H206 indicates the size of the gap)
 - DS3231 AT24C32 Real Time Clock (RTC) Module
 - 28BYJ-48 4-Phase Stepper Motor
