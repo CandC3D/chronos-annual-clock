@@ -16,8 +16,7 @@ HARDWARE
 - DS3231 AT24C32 Real Time Clock (RTC) Module
 - 28BYJ-48 4-Phase Stepper Motor
 - ULN2003 Motor Controller Board
-- (For debug version only) SSD 1306 OLED Display 128 x 64 pixels
-
+  
 DESCRIPTION OF OPERATION
 
 On startup, the ESP32 microcontroller will connect to your WiFi (using the credentials you have provided) and get the current date and time from the internet. 
