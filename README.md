@@ -23,7 +23,7 @@ On startup, the ESP32 microcontroller will connect to your WiFi (using the crede
 
 Next, the homing procedure causes the clock’s hands, which are joined and parallel to each other, to rotate clockwise until the invisible hand interrupts the infrared beam projected across the gap of the photo interrupter sensor. The sensor marks the location of December 21. This will be the date of the winter equinox for much of the 21st Century, although it is dependent on location. 
 
-Once the sensor is tripped, the ESP32 performs a calculation that moves the hand by the appropriate number of steps to reach today’s date and time. It will continue to update the hand’s position as time passes.
+Once the sensor is tripped, the ESP32 performs a calculation that moves the hand by the appropriate number of steps to reach today’s date and time. It will continue to update the hand’s position as time passes (11-12 times a day).
 
 Improvements implemented since Feb. 19:
 
