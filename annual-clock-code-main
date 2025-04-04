@@ -5,15 +5,36 @@
 #include <Wire.h>
 
 // ─────────────────────────────────────────────
-//  WiFi and NTP Settings IMPORTANT
+//  WiFi and NTP Settings
 // ─────────────────────────────────────────────
 const char* ssid     = "yourSSID";       // <-- Change to your WiFi SSID
 const char* password = "yourPASSWORD";   // <-- Change to your WiFi Password
 const char* ntpServer = "pool.ntp.org";
 
-// POSIX TZ string (example: Eastern Time)
-// Adjust as needed. See README.md for some common strings.
-const char* posix_tz = "EST5EDT,M3.2.0/2,M11.1.0/2";
+// ─────────────────────────────────────────────
+//  Time Zone Manual Offset Settings
+//  Tip: Set desOffset_sec to 0 if your region does not observe Daylight Saving Time
+// ─────────────────────────────────────────────
+// standardOffset_sec: your standard time offset in seconds (for Eastern Standard Time, -18000)
+// dstOffset_sec: additional seconds to add during DST (usually 3600)
+const long standardOffset_sec = -18000; // e.g., Eastern Standard Time (UTC-5)
+const long dstOffset_sec = 3600;          // DST adds one hour
+
+// ─────────────────────────────────────────────
+//  DST Rules Settings (U.S. example)
+//  Ignore this section if your region does not observe Daylight Saving Time
+// ─────────────────────────────────────────────
+// DST starts on the second Sunday in March at 2:00 AM
+const int DST_START_MONTH = 3;          // March
+const int DST_START_WEEK = 2;           // Second week
+const int DST_START_DAY_OF_WEEK = 0;    // Sunday (0=Sunday, 1=Monday, etc.)
+const int DST_START_HOUR = 2;           // 2:00 AM local time
+
+// DST ends on the first Sunday in November at 2:00 AM
+const int DST_END_MONTH = 11;           // November
+const int DST_END_WEEK = 1;             // First week
+const int DST_END_DAY_OF_WEEK = 0;      // Sunday
+const int DST_END_HOUR = 2;             // 2:00 AM local time
 
 // ─────────────────────────────────────────────
 //  Hardware Pin Definitions
@@ -24,14 +45,13 @@ const int homePin = 4;                       // Photo-interrupter sensor pin
 // ─────────────────────────────────────────────
 //  Stepper and Timing Constants
 // ─────────────────────────────────────────────
-const long STEPS_PER_REV = 4096;         // Number of half-steps per revolution
-const int BASE_YEAR = 2000;              // Base year for clock cycles
-const int stepDelay = 5;                 // Delay (ms) between half-steps
+const long STEPS_PER_REV = 4096;  // Number of half-steps per revolution
+const int BASE_YEAR = 2000;       // Base year for clock cycles
+const int stepDelay = 5;          // Delay (ms) between half-steps
 // (Do not redefine SECONDS_PER_DAY; RTClib already defines it.)
 
 // ─────────────────────────────────────────────
 //  User-Adjustable Sensor Delay Compensation
-//  Adjust this variable (in half-steps) to fine-tune the home position.
 // ─────────────────────────────────────────────
 const int sensorDelayAdjustmentSteps = 10; // Adjust as needed
 
@@ -44,7 +64,7 @@ const unsigned long HOME_TIMEOUT_MS      = 10000;   // Home sensor timeout (ms)
 const unsigned long NTP_ATTEMPT_TIMEOUT_MS = 300000; // NTP attempt timeout (ms)
 const unsigned long NTP_CHECK_DELAY_MS   = 1000;    // Delay between NTP time checks (ms)
 const unsigned long MAIN_LOOP_DELAY_MS   = 60000;   // Delay (ms) in main loop (non-fallback mode)
-const unsigned long FALLBACK_INTERVAL_MS = 15UL * 60UL * 1000UL; // Full revolution interval in fallback mode (ms)
+const unsigned long FALLBACK_INTERVAL_MS = 15UL * 60UL * 1000UL; // Fallback mode full revolution interval (ms)
 const unsigned long FALLBACK_DELAY_MS    = 1000;    // Delay (ms) in fallback mode loop
 
 // ─────────────────────────────────────────────
@@ -80,6 +100,68 @@ bool isLeapYear(int year) {
 }
 
 // ─────────────────────────────────────────────
+//  DST Utility Functions
+// ─────────────────────────────────────────────
+
+// Returns the day of month for DST start (e.g., second Sunday in March)
+int getDSTStartDay(int year) {
+  struct tm t = {0};
+  t.tm_year = year - 1900;
+  t.tm_mon = DST_START_MONTH - 1; // 0-indexed
+  t.tm_mday = 1;
+  t.tm_hour = DST_START_HOUR;
+  mktime(&t);
+  int offset = (DST_START_DAY_OF_WEEK - t.tm_wday + 7) % 7;
+  int firstSunday = 1 + offset;
+  int secondSunday = firstSunday + 7;
+  return secondSunday;
+}
+
+// Returns the day of month for DST end (e.g., first Sunday in November)
+int getDSTEndDay(int year) {
+  struct tm t = {0};
+  t.tm_year = year - 1900;
+  t.tm_mon = DST_END_MONTH - 1;
+  t.tm_mday = 1;
+  t.tm_hour = DST_END_HOUR;
+  mktime(&t);
+  int offset = (DST_END_DAY_OF_WEEK - t.tm_wday + 7) % 7;
+  int firstSunday = 1 + offset;
+  return firstSunday;
+}
+
+// Determines whether DST is in effect at time t.
+// The time t is assumed to be in "standard local time" (i.e. based on standardOffset_sec).
+bool isDST(time_t t) {
+  struct tm local;
+  localtime_r(&t, &local);
+  int year = local.tm_year + 1900;
+  
+  // Calculate DST start time.
+  struct tm dstStart = {0};
+  dstStart.tm_year = year - 1900;
+  dstStart.tm_mon  = DST_START_MONTH - 1;
+  dstStart.tm_mday = getDSTStartDay(year);
+  dstStart.tm_hour = DST_START_HOUR;
+  dstStart.tm_min  = 0;
+  dstStart.tm_sec  = 0;
+  time_t startTime = mktime(&dstStart);
+  
+  // Calculate DST end time.
+  struct tm dstEnd = {0};
+  dstEnd.tm_year = year - 1900;
+  dstEnd.tm_mon  = DST_END_MONTH - 1;
+  dstEnd.tm_mday = getDSTEndDay(year);
+  dstEnd.tm_hour = DST_END_HOUR;
+  dstEnd.tm_min  = 0;
+  dstEnd.tm_sec  = 0;
+  time_t endTime = mktime(&dstEnd);
+  
+  // In the US, DST starts in March and ends in November.
+  return (t >= startTime && t < endTime);
+}
+
+// ─────────────────────────────────────────────
 //  Function: powerDownStepper
 //  Sets all motor control pins LOW to save power.
 // ─────────────────────────────────────────────
@@ -105,7 +187,7 @@ void stepMotorForwardOneStep() {
 //  Moves the motor one half-step backward (counter-clockwise).
 // ─────────────────────────────────────────────
 void stepMotorBackwardOneStep() {
-  currentStepIndex = (currentStepIndex + 7) % 8; // subtract one modulo 8
+  currentStepIndex = (currentStepIndex + 7) % 8;
   for (int i = 0; i < 4; i++) {
     digitalWrite(motorPins[i], stepSequence[currentStepIndex][i]);
   }
@@ -140,31 +222,24 @@ void moveStepsBackward(long stepsToMove) {
 // ─────────────────────────────────────────────
 //  Function: homeMotor
 //  Rotates the motor slowly until the photo-interrupter sensor reads LOW
-//  (indicating the beam is interrupted), then sets the home position.
+//  (beam interrupted), then sets the home position based on the current date/time.
 // ─────────────────────────────────────────────
 void homeMotor() {
   Serial.println("Homing: Rotating until sensor is triggered (beam interrupted)...");
-  // Rotate until sensor reads LOW
   while (digitalRead(homePin) == HIGH) {
     stepMotorForwardOneStep();
     delay(stepDelay);
   }
   delay(100); // Allow sensor reading to stabilize
   
-  // Use the current time to determine the home reference (December 21)
+  // Use current time to determine the home reference (December 21)
   time_t now = time(nullptr);
   struct tm now_tm;
   localtime_r(&now, &now_tm);
   int currentYear = now_tm.tm_year + 1900;
-  // If today is December and day is 21 or later, use current year;
-  // otherwise, use previous year.
   bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
   int homeYear = isAfterHome ? currentYear : currentYear - 1;
-  
-  // Compute the number of complete cycles since BASE_YEAR.
   long cycleCount = homeYear - BASE_YEAR;
-  
-  // Set home position (adjusted by sensor delay compensation)
   currentAbsoluteSteps = cycleCount * STEPS_PER_REV - sensorDelayAdjustmentSteps;
   Serial.print("Home set: currentAbsoluteSteps = ");
   Serial.println(currentAbsoluteSteps);
@@ -175,7 +250,7 @@ void homeMotor() {
 // ─────────────────────────────────────────────
 //  Function: computeTargetSteps
 //  Computes the target absolute step count based on the current time,
-//  with a leap-year feature that skips February 29 in non-leap years.
+//  incorporating a leap-year feature that skips February 29 in non-leap years.
 // ─────────────────────────────────────────────
 long computeTargetSteps() {
   time_t now = time(nullptr);
@@ -183,14 +258,13 @@ long computeTargetSteps() {
   localtime_r(&now, &now_tm);
   int currentYear = now_tm.tm_year + 1900;
   
-  // Determine the most recent "home" (December 21)
   bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
   int homeYear = isAfterHome ? currentYear : currentYear - 1;
   
   // Build homeTime (December 21 of homeYear)
   struct tm home_tm = {0};
   home_tm.tm_year = homeYear - 1900;
-  home_tm.tm_mon  = 11; // December (tm_mon is 0-indexed)
+  home_tm.tm_mon  = 11; // December (0-indexed)
   home_tm.tm_mday = 21;
   home_tm.tm_hour = 0;
   home_tm.tm_min  = 0;
@@ -202,14 +276,17 @@ long computeTargetSteps() {
   nextHome_tm.tm_year = home_tm.tm_year + 1;
   time_t nextHomeTime = mktime(&nextHome_tm);
   
-  // Calculate elapsed seconds since homeTime
   time_t elapsed = now - homeTime;
   
-  // Leap-year adjustment:
-  // In non-leap years, skip over February 29 by subtracting one day's seconds
+  // Leap-year management:
   int febYear = homeYear + 1;
-  if (!isLeapYear(febYear)) {
-    // Create a struct for February 28, 23:59:59 of febYear
+  Serial.print("DEBUG: febYear = ");
+  Serial.println(febYear);
+  bool leap = isLeapYear(febYear);
+  Serial.print("DEBUG: isLeapYear(febYear) = ");
+  Serial.println(leap ? "true" : "false");
+  
+  if (!leap) {
     struct tm feb28_tm = {0};
     feb28_tm.tm_year = febYear - 1900;
     feb28_tm.tm_mon  = 1;  // February (0-indexed)
@@ -218,10 +295,17 @@ long computeTargetSteps() {
     feb28_tm.tm_min  = 59;
     feb28_tm.tm_sec  = 59;
     time_t feb28End = mktime(&feb28_tm);
-    // If current time is past February 28, subtract one day's seconds
+    Serial.print("DEBUG: feb28End = ");
+    Serial.println(feb28End);
+    
     if (now > feb28End) {
+      Serial.println("DEBUG: Current time is past Feb 28; subtracting one day's seconds.");
       elapsed -= SECONDS_PER_DAY;
+    } else {
+      Serial.println("DEBUG: Current time is before Feb 28; no subtraction.");
     }
+  } else {
+    Serial.println("DEBUG: Leap year detected; no subtraction.");
   }
   
   double fraction = double(elapsed) / double(nextHomeTime - homeTime);
@@ -230,6 +314,12 @@ long computeTargetSteps() {
   
   long cycleCount = homeYear - BASE_YEAR;
   long targetSteps = cycleCount * STEPS_PER_REV + long(fraction * STEPS_PER_REV);
+  Serial.print("DEBUG: elapsed seconds = ");
+  Serial.println(elapsed);
+  Serial.print("DEBUG: fraction of cycle = ");
+  Serial.println(fraction);
+  Serial.print("DEBUG: targetSteps = ");
+  Serial.println(targetSteps);
   return targetSteps;
 }
 
@@ -237,18 +327,22 @@ long computeTargetSteps() {
 //  setup()
 // ─────────────────────────────────────────────
 void setup() {
+  // Remove POSIX TZ usage entirely.
+  // Instead, we use manual offsets.
+  
+  // Configure system time with the standard offset.
+  // This sets system time to local standard time.
+  configTime(standardOffset_sec, 0, ntpServer);
+  
   Serial.begin(115200);
   Serial.println("\nAnnual Clock Project Starting...");
 
-  // Initialize motor control pins.
   for (int i = 0; i < 4; i++) {
     pinMode(motorPins[i], OUTPUT);
     digitalWrite(motorPins[i], LOW);
   }
-  // Use the same sensor pin mode as the original successful version.
   pinMode(homePin, INPUT);
 
-  // ───── WiFi Connection with Timeout ─────
   Serial.print("Connecting to WiFi");
   WiFi.begin(ssid, password);
   unsigned long wifiStartTime = millis();
@@ -264,11 +358,6 @@ void setup() {
     Serial.println("\nWiFi connected.");
   }
   
-  // Set time zone.
-  setenv("TZ", posix_tz, 1);
-  tzset();
-
-  // ───── RTC Initialization ─────
   if (!rtc.begin()) {
     Serial.println("Couldn't find RTC. Check your hardware connection.");
     rtcAvailable = false;
@@ -276,13 +365,13 @@ void setup() {
     Serial.println("RTC initialized successfully.");
   }
   
-  // ───── Time Acquisition ─────
+  // Time Acquisition:
   bool timeSet = false;
   if (WiFi.status() == WL_CONNECTED) {
     int timeAttempts = 0;
     while (timeAttempts < 3 && !timeSet) {
       Serial.println("Attempting to get internet time...");
-      configTime(0, 0, ntpServer);
+      configTime(standardOffset_sec, 0, ntpServer); // Set system time to standard time.
       unsigned long attemptStart = millis();
       while (millis() - attemptStart < NTP_ATTEMPT_TIMEOUT_MS) {
         if (time(nullptr) > 1000000000) {
@@ -305,16 +394,14 @@ void setup() {
         timeSet = true;
       }
     }
-  }
-  else {
+  } else {
     Serial.println("WiFi not connected, attempting to use RTC time...");
     if (rtcAvailable) {
       DateTime rtcTime = rtc.now();
       if (!rtc.lostPower() && rtcTime.year() > 2000) {
         Serial.println("Using RTC time.");
         timeSet = true;
-      }
-      else {
+      } else {
         Serial.println("RTC time invalid.");
       }
     }
@@ -325,13 +412,14 @@ void setup() {
     Serial.println("No valid time available. Entering fallback mode.");
   }
   else {
-    // If WiFi is not connected, update system time from RTC.
     if (WiFi.status() != WL_CONNECTED && rtcAvailable) {
       DateTime rtcTime = rtc.now();
       timeval tv;
       tv.tv_sec = rtcTime.unixtime();
       tv.tv_usec = 0;
       settimeofday(&tv, NULL);
+      // Reconfigure time using the standard offset.
+      configTime(standardOffset_sec, 0, ntpServer);
       Serial.println("System time updated from RTC.");
     }
     else if (WiFi.status() == WL_CONNECTED) {
@@ -350,7 +438,7 @@ void setup() {
   // Perform homing.
   homeMotor();
   
-  // If not in fallback mode, set initial motor position.
+  // Set initial motor position.
   if (!fallbackMode) {
     long target = computeTargetSteps();
     Serial.print("Initial target steps = ");
@@ -387,7 +475,12 @@ void loop() {
       moveSteps(stepsToMove);
     }
     
+    // Get current system time (which is in standard time) and adjust for DST manually.
     time_t now = time(nullptr);
+    // If DST is in effect, add dstOffset_sec.
+    if (isDST(now)) {
+      now += dstOffset_sec;
+    }
     struct tm now_tm;
     localtime_r(&now, &now_tm);
     
