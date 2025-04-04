@@ -32,9 +32,3 @@ Improvements implemented since Feb. 19:
 - Improved variable handling
 - Improved failure handling
 - Improved accuracy
-
-Ukraine: EET-2EEST,M3.5.0/3,M10.5.0/4
-
-United Kingdom: GMT0BST,M3.5.0/1,M10.5.0/2
-
-
