@@ -97,7 +97,6 @@ void moveSteps(long stepsToMove) {
 // ─────────────────────────────────────────────
 //  Function: homeMotor
 //  Slowly rotates the motor until the photo-interrupter sensor
-//  (now assumed to output LOW when the beam is interrupted)
 //  is triggered. Then, it resets the currentAbsoluteSteps count
 //  so that the home position corresponds to an integer multiple of STEPS_PER_REV.
 // ─────────────────────────────────────────────
