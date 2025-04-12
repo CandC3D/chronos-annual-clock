@@ -13,7 +13,7 @@ const char* ntpServer = "pool.ntp.org";
 
 // ─────────────────────────────────────────────
 //  Time Zone Manual Offset Settings
-//  Tip: Set desOffset_sec to 0 if your region does not observe Daylight Saving Time
+//  Set desOffset_sec to 0 if your region does not observe Daylight Saving Time
 // ─────────────────────────────────────────────
 // standardOffset_sec: your standard time offset in seconds (for Eastern Standard Time, -18000)
 // dstOffset_sec: additional seconds to add during DST (usually 3600)
