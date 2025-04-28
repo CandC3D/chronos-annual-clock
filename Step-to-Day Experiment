@@ -1,0 +1,298 @@
+// ─────────────────────────────────────────────────────
+//  Annual Clock Version: Stepping Mode + Manual Button
+// ─────────────────────────────────────────────────────
+
+#include <WiFi.h>
+#include <time.h>
+#include <sys/time.h>
+#include <RTClib.h>
+#include <Wire.h>
+
+// ─────────────────────────────────────────────
+//  WiFi and NTP Settings
+// ─────────────────────────────────────────────
+const char* ssid     = "yourSSID";      // <-- Your WiFi SSID
+const char* password = "yourPASSWORD";  // <-- Your WiFi Password
+const char* ntpServer = "pool.ntp.org";
+
+// ─────────────────────────────────────────────
+//  Time Zone Manual Offset Settings
+// ─────────────────────────────────────────────
+const long standardOffset_sec = -18000; // Eastern Standard Time (UTC-5)
+const long dstOffset_sec = 3600;         // DST adds one hour
+
+// ─────────────────────────────────────────────
+//  DST Rules (U.S. Example)
+// ─────────────────────────────────────────────
+const int DST_START_MONTH = 3; // March
+const int DST_START_WEEK = 2;  // Second week
+const int DST_START_DAY_OF_WEEK = 0; // Sunday
+const int DST_START_HOUR = 2;  // 2:00 AM
+const int DST_END_MONTH = 11;  // November
+const int DST_END_WEEK = 1;    // First week
+const int DST_END_DAY_OF_WEEK = 0; // Sunday
+const int DST_END_HOUR = 2;    // 2:00 AM
+
+// ─────────────────────────────────────────────
+//  Hardware Definitions
+// ─────────────────────────────────────────────
+const int motorPins[4] = {27, 14, 13, 12}; // IN1, IN2, IN3, IN4
+const int homePin = 4;                    // Photo-interrupter sensor pin
+const int buttonPin = 33;                  // Manual advance button pin
+
+// ─────────────────────────────────────────────
+//  Stepper Motor Constants
+// ─────────────────────────────────────────────
+const long STEPS_PER_REV = 4096; // Half-steps per full revolution
+const float STEPS_PER_DAY = (float)STEPS_PER_REV / 366.0; // ~11.187
+const int stepDelay = 5;         // Milliseconds between half-steps
+
+// ─────────────────────────────────────────────
+//  Timing Constants
+// ─────────────────────────────────────────────
+const unsigned long MAIN_LOOP_DELAY_MS = 60000;
+const unsigned long debounceDelay = 200; // ms for button debounce
+
+// ─────────────────────────────────────────────
+//  Other Constants
+// ─────────────────────────────────────────────
+const int BASE_YEAR = 2000;
+const int sensorDelayAdjustmentSteps = 10;
+const long SECONDS_PER_DAY = 86400;
+
+// ─────────────────────────────────────────────
+//  Global Variables
+// ─────────────────────────────────────────────
+RTC_DS3231 rtc;
+bool rtcAvailable = true;
+bool fallbackMode = false;
+
+int stepSequence[8][4] = {
+  {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
+  {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
+};
+int currentStepIndex = 0;
+volatile long currentAbsoluteSteps = 0;
+
+long lastDayOfYear = -1;
+float accumulatedSteps = 0;
+unsigned long lastButtonPressTime = 0;
+
+// ─────────────────────────────────────────────
+//  Helper Functions
+// ─────────────────────────────────────────────
+
+bool isLeapYear(int year) {
+  return ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+}
+
+void powerDownStepper() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], LOW);
+  }
+}
+
+void stepMotorForwardOneStep() {
+  currentStepIndex = (currentStepIndex + 1) % 8;
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(motorPins[i], stepSequence[currentStepIndex][i]);
+  }
+}
+
+void moveSteps(long stepsToMove) {
+  for (long i = 0; i < stepsToMove; i++) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+    currentAbsoluteSteps++;
+  }
+  powerDownStepper();
+}
+
+void homeMotor() {
+  Serial.println("Homing motor to December 21 marker...");
+  while (digitalRead(homePin) == HIGH) {
+    stepMotorForwardOneStep();
+    delay(stepDelay);
+  }
+  delay(100);
+
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+  long cycleCount = homeYear - BASE_YEAR;
+
+  currentAbsoluteSteps = cycleCount * STEPS_PER_REV - sensorDelayAdjustmentSteps;
+  powerDownStepper();
+}
+
+long computeDaysSinceHome() {
+  time_t now = time(nullptr);
+  struct tm now_tm;
+  localtime_r(&now, &now_tm);
+  int currentYear = now_tm.tm_year + 1900;
+
+  bool isAfterHome = (now_tm.tm_mon == 11 && now_tm.tm_mday >= 21);
+  int homeYear = isAfterHome ? currentYear : currentYear - 1;
+
+  struct tm home_tm = {0};
+  home_tm.tm_year = homeYear - 1900;
+  home_tm.tm_mon  = 11;
+  home_tm.tm_mday = 21;
+  home_tm.tm_hour = 0;
+  home_tm.tm_min  = 0;
+  home_tm.tm_sec  = 0;
+  time_t homeTime = mktime(&home_tm);
+
+  time_t elapsed = now - homeTime;
+
+  int dayNumber = elapsed / SECONDS_PER_DAY;
+
+  // Leap year correction
+  int febYear = homeYear + 1;
+  if (!isLeapYear(febYear)) {
+    struct tm feb28_tm = {0};
+    feb28_tm.tm_year = febYear - 1900;
+    feb28_tm.tm_mon  = 1;
+    feb28_tm.tm_mday = 28;
+    feb28_tm.tm_hour = 23;
+    feb28_tm.tm_min  = 59;
+    feb28_tm.tm_sec  = 59;
+    time_t feb28End = mktime(&feb28_tm);
+    if (now > feb28End) {
+      dayNumber--;
+    }
+  }
+
+  if (dayNumber < 0) dayNumber = 0;
+  if (dayNumber > 365) dayNumber = 365;
+
+  return dayNumber;
+}
+
+bool isDST(time_t t) {
+  struct tm local;
+  localtime_r(&t, &local);
+  int year = local.tm_year + 1900;
+
+  struct tm dstStart = {0};
+  dstStart.tm_year = year - 1900;
+  dstStart.tm_mon  = DST_START_MONTH - 1;
+  dstStart.tm_mday = 1;
+  mktime(&dstStart);
+  dstStart.tm_mday += (DST_START_DAY_OF_WEEK - dstStart.tm_wday + 7) % 7 + 7;
+  dstStart.tm_hour = DST_START_HOUR;
+
+  struct tm dstEnd = {0};
+  dstEnd.tm_year = year - 1900;
+  dstEnd.tm_mon  = DST_END_MONTH - 1;
+  dstEnd.tm_mday = 1;
+  mktime(&dstEnd);
+  dstEnd.tm_mday += (DST_END_DAY_OF_WEEK - dstEnd.tm_wday + 7) % 7;
+  dstEnd.tm_hour = DST_END_HOUR;
+
+  time_t startTime = mktime(&dstStart);
+  time_t endTime = mktime(&dstEnd);
+
+  return (t >= startTime && t < endTime);
+}
+
+// ─────────────────────────────────────────────
+//  Setup
+// ─────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nAnnual Clock Starting...");
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(motorPins[i], OUTPUT);
+    digitalWrite(motorPins[i], LOW);
+  }
+  pinMode(homePin, INPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  WiFi.begin(ssid, password);
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Connected." : "WiFi Failed.");
+
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC.");
+    rtcAvailable = false;
+  }
+
+  configTime(standardOffset_sec, 0, ntpServer);
+  delay(2000);
+
+  if (time(nullptr) < 1000000000) fallbackMode = true;
+
+  if (!fallbackMode) {
+    homeMotor();
+
+    long daysSinceHome = computeDaysSinceHome();
+    float totalSteps = daysSinceHome * STEPS_PER_DAY;
+    long fullSteps = (long)totalSteps;
+    accumulatedSteps = totalSteps - fullSteps;
+
+    moveSteps(fullSteps);
+
+    time_t now = time(nullptr);
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+    lastDayOfYear = now_tm.tm_yday;
+  }
+  else {
+    Serial.println("Entering fallback mode.");
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Main Loop
+// ─────────────────────────────────────────────
+
+void loop() {
+  if (!fallbackMode) {
+    time_t now = time(nullptr);
+    if (isDST(now)) now += dstOffset_sec;
+
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+
+    int currentDayOfYear = now_tm.tm_yday;
+
+    if (currentDayOfYear != lastDayOfYear) {
+      Serial.println("Midnight: advancing one day.");
+
+      accumulatedSteps += STEPS_PER_DAY;
+      long stepsToMove = (long)accumulatedSteps;
+      accumulatedSteps -= stepsToMove;
+
+      moveSteps(stepsToMove);
+      lastDayOfYear = currentDayOfYear;
+    }
+
+    if (digitalRead(buttonPin) == LOW) {
+      unsigned long nowMillis = millis();
+      if (nowMillis - lastButtonPressTime > debounceDelay) {
+        Serial.println("Manual Advance Button Pressed!");
+        accumulatedSteps += STEPS_PER_DAY;
+        long stepsToMove = (long)accumulatedSteps;
+        accumulatedSteps -= stepsToMove;
+
+        moveSteps(stepsToMove);
+        lastDayOfYear++;
+        if (lastDayOfYear > 365) lastDayOfYear = 0;
+
+        lastButtonPressTime = nowMillis;
+      }
+    }
+
+    delay(MAIN_LOOP_DELAY_MS);
+  }
+}
